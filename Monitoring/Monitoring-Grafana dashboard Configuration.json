@@ -1,0 +1,177 @@
+{
+  "dashboard": {
+    "title": "PumpFun Trading Bot - Overview",
+    "uid": "pumpfun-overview",
+    "timezone": "browser",
+    "panels": [
+      {
+        "title": "Portfolio Value",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "pumpfun_total_value_sol",
+            "legendFormat": "Total Value"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "SOL",
+            "decimals": 3
+          }
+        },
+        "gridPos": {"x": 0, "y": 0, "w": 4, "h": 3}
+      },
+      {
+        "title": "24h PnL",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "pumpfun_daily_pnl_sol",
+            "legendFormat": "24h PnL"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "SOL",
+            "decimals": 3,
+            "color": {
+              "mode": "thresholds"
+            },
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "green", "value": 0}
+              ]
+            }
+          }
+        },
+        "gridPos": {"x": 4, "y": 0, "w": 4, "h": 3}
+      },
+      {
+        "title": "Active Positions",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "pumpfun_active_positions",
+            "legendFormat": "Positions"
+          }
+        ],
+        "gridPos": {"x": 8, "y": 0, "w": 4, "h": 3}
+      },
+      {
+        "title": "Win Rate",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "pumpfun_winning_trades / (pumpfun_winning_trades + pumpfun_losing_trades) * 100",
+            "legendFormat": "Win Rate"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 40},
+                {"color": "green", "value": 60}
+              ]
+            }
+          }
+        },
+        "gridPos": {"x": 12, "y": 0, "w": 4, "h": 3}
+      },
+      {
+        "title": "Portfolio Equity Curve",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "pumpfun_total_value_sol",
+            "legendFormat": "Portfolio Value"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "SOL"
+          }
+        },
+        "gridPos": {"x": 0, "y": 3, "w": 16, "h": 8}
+      },
+      {
+        "title": "Order Execution Rate",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(pumpfun_orders_executed_total[5m])",
+            "legendFormat": "Executed"
+          },
+          {
+            "expr": "rate(pumpfun_orders_failed_total[5m])",
+            "legendFormat": "Failed"
+          }
+        ],
+        "gridPos": {"x": 16, "y": 3, "w": 8, "h": 4}
+      },
+      {
+        "title": "RPC Latency (p95)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(pumpfun_rpc_latency_seconds_bucket[5m]))",
+            "legendFormat": "p95 Latency"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s"
+          }
+        },
+        "gridPos": {"x": 16, "y": 7, "w": 8, "h": 4}
+      },
+      {
+        "title": "Position PnL Distribution",
+        "type": "piechart",
+        "targets": [
+          {
+            "expr": "sum(pumpfun_position_pnl_sol > 0)",
+            "legendFormat": "Profitable"
+          },
+          {
+            "expr": "sum(pumpfun_position_pnl_sol <= 0)",
+            "legendFormat": "Unprofitable"
+          }
+        ],
+        "gridPos": {"x": 0, "y": 11, "w": 6, "h": 4}
+      },
+      {
+        "title": "Trade Volume (SOL)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(pumpfun_total_volume_sol[1h]) * 3600",
+            "legendFormat": "Hourly Volume"
+          }
+        ],
+        "gridPos": {"x": 6, "y": 11, "w": 10, "h": 4}
+      },
+      {
+        "title": "Sandwich Attacks Detected",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "increase(pumpfun_sandwich_attacks_detected_total[1h])",
+            "legendFormat": "Last Hour"
+          }
+        ],
+        "gridPos": {"x": 16, "y": 11, "w": 4, "h": 4}
+      }
+    ],
+    "refresh": "10s",
+    "time": {
+      "from": "now-6h",
+      "to": "now"
+    }
+  }
+}

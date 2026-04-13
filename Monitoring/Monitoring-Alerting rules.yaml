@@ -1,0 +1,180 @@
+# monitoring/prometheus/alerts.yml
+groups:
+  - name: pumpfun_bot_alerts
+    interval: 30s
+    rules:
+      # Order execution alerts
+      - alert: HighOrderFailureRate
+        expr: |
+          rate(pumpfun_orders_failed_total[5m]) / 
+          rate(pumpfun_orders_submitted_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+          component: execution
+        annotations:
+          summary: "High order failure rate detected"
+          description: "Order failure rate is {{ $value | humanizePercentage }} over the last 5 minutes"
+          runbook_url: "https://wiki.example.com/runbooks/high-order-failure"
+
+      - alert: CriticalOrderFailureRate
+        expr: |
+          rate(pumpfun_orders_failed_total[5m]) / 
+          rate(pumpfun_orders_submitted_total[5m]) > 0.25
+        for: 1m
+        labels:
+          severity: critical
+          component: execution
+        annotations:
+          summary: "Critical order failure rate"
+          description: "Order failure rate is {{ $value | humanizePercentage }} - immediate attention required"
+          runbook_url: "https://wiki.example.com/runbooks/critical-order-failure"
+
+      # MEV protection alerts
+      - alert: SandwichAttackDetected
+        expr: increase(pumpfun_sandwich_attacks_detected_total[1m]) > 5
+        for: 1m
+        labels:
+          severity: warning
+          component: mev
+        annotations:
+          summary: "Multiple sandwich attacks detected"
+          description: "{{ $value }} sandwich attacks detected in the last minute"
+
+      - alert: MEVProtectionDisabled
+        expr: pumpfun_mev_protected_trades_total == 0 and pumpfun_total_trades > 10
+        for: 5m
+        labels:
+          severity: warning
+          component: mev
+        annotations:
+          summary: "MEV protection may be disabled"
+          description: "No MEV-protected trades in the last 5 minutes despite active trading"
+
+      # RPC performance alerts
+      - alert: HighRPCLatency
+        expr: histogram_quantile(0.95, rate(pumpfun_rpc_latency_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+          component: rpc
+        annotations:
+          summary: "High RPC latency detected"
+          description: "95th percentile RPC latency is {{ $value }}s"
+
+      - alert: RPCErrorsIncreasing
+        expr: rate(pumpfun_rpc_errors_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          component: rpc
+        annotations:
+          summary: "RPC errors increasing"
+          description: "RPC error rate is {{ $value }} errors/second"
+
+      # Risk management alerts
+      - alert: DailyLossLimitApproaching
+        expr: pumpfun_daily_pnl_sol < -5
+        for: 1m
+        labels:
+          severity: warning
+          component: risk
+        annotations:
+          summary: "Daily loss limit approaching"
+          description: "Daily PnL is {{ $value }} SOL (limit: 10 SOL)"
+
+      - alert: DailyLossLimitExceeded
+        expr: pumpfun_daily_pnl_sol < -10
+        for: 1m
+        labels:
+          severity: critical
+          component: risk
+        annotations:
+          summary: "Daily loss limit exceeded"
+          description: "Daily PnL is {{ $value }} SOL - emergency stop recommended"
+
+      - alert: HighDrawdown
+        expr: pumpfun_max_drawdown_pct > 20
+        for: 5m
+        labels:
+          severity: warning
+          component: risk
+        annotations:
+          summary: "High portfolio drawdown"
+          description: "Current drawdown is {{ $value }}%"
+
+      # Position alerts
+      - alert: HighPositionConcentration
+        expr: |
+          (sum(pumpfun_position_value_sol) by (mint) / 
+          pumpfun_total_exposure_sol) > 0.25
+        for: 5m
+        labels:
+          severity: warning
+          component: risk
+        annotations:
+          summary: "High position concentration"
+          description: "Token {{ $labels.mint }} represents {{ $value | humanizePercentage }} of portfolio"
+
+      - alert: StalePosition
+        expr: time() - pumpfun_position_last_update_seconds > 300
+        for: 2m
+        labels:
+          severity: warning
+          component: execution
+        annotations:
+          summary: "Position has stale data"
+          description: "Position {{ $labels.mint }} has not been updated in {{ $value }} seconds"
+
+      # System alerts
+      - alert: BotNotProducingMetrics
+        expr: up{job=~"pumpfun-bot.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: system
+        annotations:
+          summary: "Bot is down"
+          description: "{{ $labels.job }} metrics endpoint is not reachable"
+
+      - alert: HighMemoryUsage
+        expr: pumpfun_memory_usage_bytes / 1024 / 1024 / 1024 > 4
+        for: 5m
+        labels:
+          severity: warning
+          component: system
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value }} GB"
+
+      - alert: DatabaseConnectionPoolExhausted
+        expr: pg_stat_database_numbackends{datname="pumpfun"} > 80
+        for: 2m
+        labels:
+          severity: warning
+          component: database
+        annotations:
+          summary: "Database connection pool near exhaustion"
+          description: "{{ $value }} active connections"
+
+      # Trading performance alerts
+      - alert: WinRateDropping
+        expr: |
+          (pumpfun_winning_trades / (pumpfun_winning_trades + pumpfun_losing_trades)) < 0.4
+        for: 1h
+        labels:
+          severity: warning
+          component: trading
+        annotations:
+          summary: "Win rate has dropped significantly"
+          description: "Current win rate is {{ $value | humanizePercentage }}"
+
+      - alert: NoTradesInLastHour
+        expr: increase(pumpfun_total_trades[1h]) == 0
+        for: 1h
+        labels:
+          severity: info
+          component: trading
+        annotations:
+          summary: "No trades in the last hour"
+          description: "Bot may not be receiving signals or executing trades"

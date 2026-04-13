@@ -1,0 +1,77 @@
+# monitoring/alertmanager/alertmanager.yml
+global:
+  resolve_timeout: 5m
+  slack_api_url: '${SLACK_WEBHOOK_URL}'
+
+route:
+  group_by: ['alertname', 'component']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'default-receiver'
+  
+  routes:
+    - match:
+        severity: critical
+      receiver: 'critical-receiver'
+      continue: true
+    
+    - match:
+        severity: warning
+      receiver: 'warning-receiver'
+    
+    - match:
+        component: trading
+      receiver: 'trading-receiver'
+
+receivers:
+  - name: 'default-receiver'
+    email_configs:
+      - to: '${ALERT_EMAIL}'
+        from: 'alerts@pumpfun-bot.com'
+        smarthost: 'smtp.gmail.com:587'
+        auth_username: '${SMTP_USERNAME}'
+        auth_password: '${SMTP_PASSWORD}'
+
+  - name: 'critical-receiver'
+    slack_configs:
+      - channel: '#critical-alerts'
+        title: '🚨 [CRITICAL] {{ .GroupLabels.alertname }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+          *Severity:* {{ .CommonLabels.severity }}
+          *Component:* {{ .CommonLabels.component }}
+          *Started:* {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ range .Alerts }}
+          *Details:* {{ .Annotations.description }}
+          {{ end }}
+    email_configs:
+      - to: '${ONCALL_EMAIL}'
+        from: 'alerts@pumpfun-bot.com'
+        headers:
+          Subject: '[CRITICAL] {{ .GroupLabels.alertname }}'
+
+  - name: 'warning-receiver'
+    slack_configs:
+      - channel: '#bot-alerts'
+        title: '⚠️ [WARNING] {{ .GroupLabels.alertname }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+          *Component:* {{ .CommonLabels.component }}
+
+  - name: 'trading-receiver'
+    slack_configs:
+      - channel: '#trading-alerts'
+        title: '📊 [TRADING] {{ .GroupLabels.alertname }}'
+        text: |
+          *Alert:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+
+inhibit_rules:
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['alertname', 'component']
