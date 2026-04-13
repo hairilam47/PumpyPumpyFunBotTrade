@@ -1,0 +1,181 @@
+// instruction_data.rs
+use anchor_lang::prelude::*;
+use solana_sdk::instruction::Instruction;
+
+/// Build create token instruction
+pub fn create_token_instruction(
+    program_id: &Pubkey,
+    creator: &Pubkey,
+    mint: &Pubkey,
+    name: String,
+    symbol: String,
+    uri: String,
+) -> Instruction {
+    // Anchor discriminator for "create_token"
+    let discriminator = anchor_lang::hash::hash("global:create_token".as_bytes()).to_bytes();
+    
+    let mut data = Vec::with_capacity(8 + 4 + name.len() + 4 + symbol.len() + 4 + uri.len());
+    data.extend_from_slice(&discriminator[..8]);
+    
+    // Serialize name
+    data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    data.extend_from_slice(name.as_bytes());
+    
+    // Serialize symbol
+    data.extend_from_slice(&(symbol.len() as u32).to_le_bytes());
+    data.extend_from_slice(symbol.as_bytes());
+    
+    // Serialize uri
+    data.extend_from_slice(&(uri.len() as u32).to_le_bytes());
+    data.extend_from_slice(uri.as_bytes());
+    
+    // Derive bonding curve PDA
+    let (bonding_curve, _) = Pubkey::find_program_address(
+        &[b"bonding-curve", mint.as_ref()],
+        program_id,
+    );
+    
+    // Derive global PDA
+    let (global, _) = Pubkey::find_program_address(
+        &[b"global"],
+        program_id,
+    );
+    
+    // Get bonding curve token account
+    let bonding_curve_token_account = spl_associated_token_account::get_associated_token_address(
+        &bonding_curve,
+        mint,
+    );
+    
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*creator, true),
+            AccountMeta::new(*mint, true),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(bonding_curve_token_account, false),
+            AccountMeta::new_readonly(global, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+            AccountMeta::new_readonly(spl_associated_token_account::id(), false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::id(), false),
+        ],
+        data,
+    }
+}
+
+/// Build buy instruction
+pub fn buy_instruction(
+    program_id: &Pubkey,
+    user: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+    max_sol_cost: u64,
+) -> Instruction {
+    // Anchor discriminator for "buy"
+    let discriminator = anchor_lang::hash::hash("global:buy".as_bytes()).to_bytes();
+    
+    let mut data = Vec::with_capacity(8 + 8 + 8);
+    data.extend_from_slice(&discriminator[..8]);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&max_sol_cost.to_le_bytes());
+    
+    // Derive bonding curve PDA
+    let (bonding_curve, _) = Pubkey::find_program_address(
+        &[b"bonding-curve", mint.as_ref()],
+        program_id,
+    );
+    
+    // Derive global PDA
+    let (global, _) = Pubkey::find_program_address(
+        &[b"global"],
+        program_id,
+    );
+    
+    // Get associated token accounts
+    let user_token_account = spl_associated_token_account::get_associated_token_address(
+        user,
+        mint,
+    );
+    let bonding_curve_token_account = spl_associated_token_account::get_associated_token_address(
+        &bonding_curve,
+        mint,
+    );
+    
+    // Fee recipient (hardcoded for now, should come from global state)
+    let fee_recipient = crate::constants::FEE_RECIPIENT;
+    
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*user, true),
+            AccountMeta::new(user_token_account, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(bonding_curve_token_account, false),
+            AccountMeta::new(*mint, false),
+            AccountMeta::new_readonly(global, false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+        data,
+    }
+}
+
+/// Build sell instruction
+pub fn sell_instruction(
+    program_id: &Pubkey,
+    user: &Pubkey,
+    mint: &Pubkey,
+    amount: u64,
+    min_sol_output: u64,
+) -> Instruction {
+    // Anchor discriminator for "sell"
+    let discriminator = anchor_lang::hash::hash("global:sell".as_bytes()).to_bytes();
+    
+    let mut data = Vec::with_capacity(8 + 8 + 8);
+    data.extend_from_slice(&discriminator[..8]);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&min_sol_output.to_le_bytes());
+    
+    // Derive bonding curve PDA
+    let (bonding_curve, _) = Pubkey::find_program_address(
+        &[b"bonding-curve", mint.as_ref()],
+        program_id,
+    );
+    
+    // Derive global PDA
+    let (global, _) = Pubkey::find_program_address(
+        &[b"global"],
+        program_id,
+    );
+    
+    // Get associated token accounts
+    let user_token_account = spl_associated_token_account::get_associated_token_address(
+        user,
+        mint,
+    );
+    let bonding_curve_token_account = spl_associated_token_account::get_associated_token_address(
+        &bonding_curve,
+        mint,
+    );
+    
+    // Fee recipient
+    let fee_recipient = crate::constants::FEE_RECIPIENT;
+    
+    Instruction {
+        program_id: *program_id,
+        accounts: vec![
+            AccountMeta::new(*user, true),
+            AccountMeta::new(user_token_account, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(bonding_curve_token_account, false),
+            AccountMeta::new(*mint, false),
+            AccountMeta::new_readonly(global, false),
+            AccountMeta::new(fee_recipient, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            AccountMeta::new_readonly(spl_token::id(), false),
+        ],
+        data,
+    }
+}

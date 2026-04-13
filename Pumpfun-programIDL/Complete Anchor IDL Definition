@@ -1,0 +1,623 @@
+// pumpfun_idl.rs
+use anchor_lang::prelude::*;
+
+declare_id!("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+#[program]
+pub mod pumpfun {
+    use super::*;
+
+    /// Initialize the global state
+    pub fn initialize(ctx: Context<Initialize>, params: InitializeParams) -> Result<()> {
+        let global = &mut ctx.accounts.global;
+        global.authority = ctx.accounts.authority.key();
+        global.fee_recipient = params.fee_recipient;
+        global.fee_basis_points = params.fee_basis_points;
+        global.migration_threshold = params.migration_threshold;
+        global.total_tokens_created = 0;
+        global.total_volume = 0;
+        global.bump = ctx.bumps.global;
+        Ok(())
+    }
+
+    /// Create a new token with bonding curve
+    pub fn create_token(
+        ctx: Context<CreateToken>,
+        name: String,
+        symbol: String,
+        uri: String,
+    ) -> Result<()> {
+        require!(name.len() <= 32, ErrorCode::NameTooLong);
+        require!(symbol.len() <= 10, ErrorCode::SymbolTooLong);
+        require!(uri.len() <= 200, ErrorCode::UriTooLong);
+        
+        let bonding_curve = &mut ctx.accounts.bonding_curve;
+        bonding_curve.mint = ctx.accounts.mint.key();
+        bonding_curve.creator = ctx.accounts.creator.key();
+        bonding_curve.virtual_sol_reserves = 30_000_000_000; // 30 SOL initial
+        bonding_curve.virtual_token_reserves = 1_073_000_000_000_000; // ~1B tokens
+        bonding_curve.real_sol_reserves = 0;
+        bonding_curve.real_token_reserves = 1_073_000_000_000_000;
+        bonding_curve.complete = false;
+        bonding_curve.created_at = Clock::get()?.unix_timestamp;
+        bonding_curve.bump = ctx.bumps.bonding_curve;
+        
+        // Mint initial supply to bonding curve
+        let cpi_accounts = spl_token::MintTo {
+            mint: ctx.accounts.mint.to_account_info(),
+            to: ctx.accounts.bonding_curve_token_account.to_account_info(),
+            authority: ctx.accounts.bonding_curve.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        spl_token::mint_to(
+            cpi_ctx,
+            1_073_000_000_000_000, // 1,073,000,000 tokens (with 6 decimals)
+        )?;
+        
+        // Update global state
+        let global = &mut ctx.accounts.global;
+        global.total_tokens_created = global.total_tokens_created.checked_add(1).unwrap();
+        
+        // Emit creation event
+        emit!(TokenCreatedEvent {
+            mint: ctx.accounts.mint.key(),
+            creator: ctx.accounts.creator.key(),
+            name,
+            symbol,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Buy tokens from bonding curve
+    pub fn buy(
+        ctx: Context<Buy>,
+        amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(!ctx.accounts.bonding_curve.complete, ErrorCode::BondingCurveComplete);
+        
+        let bonding_curve = &mut ctx.accounts.bonding_curve;
+        
+        // Calculate cost using bonding curve formula
+        let sol_cost = bonding_curve.calculate_buy_price(amount)?;
+        require!(sol_cost <= max_sol_cost, ErrorCode::SlippageExceeded);
+        
+        // Calculate fee
+        let global = &ctx.accounts.global;
+        let fee = sol_cost
+            .checked_mul(global.fee_basis_points as u64)
+            .unwrap()
+            .checked_div(10_000)
+            .unwrap();
+        let net_sol = sol_cost.checked_sub(fee).unwrap();
+        
+        // Transfer SOL from user
+        let transfer_ix = solana_program::system_instruction::transfer(
+            ctx.accounts.user.key,
+            &bonding_curve.key(),
+            sol_cost,
+        );
+        solana_program::program::invoke(
+            &transfer_ix,
+            &[
+                ctx.accounts.user.to_account_info(),
+                ctx.accounts.bonding_curve.to_account_info(),
+                ctx.accounts.system_program.to_account_info(),
+            ],
+        )?;
+        
+        // Transfer fee
+        **ctx.accounts.bonding_curve.try_borrow_mut_lamports()? -= fee;
+        **ctx.accounts.fee_recipient.try_borrow_mut_lamports()? += fee;
+        
+        // Transfer tokens to user
+        let seeds = &[
+            b"bonding-curve",
+            ctx.accounts.mint.key().as_ref(),
+            &[bonding_curve.bump],
+        ];
+        let signer = &[&seeds[..]];
+        
+        let cpi_accounts = spl_token::Transfer {
+            from: ctx.accounts.bonding_curve_token_account.to_account_info(),
+            to: ctx.accounts.user_token_account.to_account_info(),
+            authority: ctx.accounts.bonding_curve.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+            signer,
+        );
+        spl_token::transfer(cpi_ctx, amount)?;
+        
+        // Update bonding curve state
+        bonding_curve.virtual_sol_reserves = bonding_curve
+            .virtual_sol_reserves
+            .checked_add(net_sol)
+            .unwrap();
+        bonding_curve.virtual_token_reserves = bonding_curve
+            .virtual_token_reserves
+            .checked_sub(amount)
+            .unwrap();
+        bonding_curve.real_sol_reserves = bonding_curve
+            .real_sol_reserves
+            .checked_add(net_sol)
+            .unwrap();
+        bonding_curve.real_token_reserves = bonding_curve
+            .real_token_reserves
+            .checked_sub(amount)
+            .unwrap();
+        
+        // Update global volume
+        let global = &mut ctx.accounts.global;
+        global.total_volume = global.total_volume.checked_add(sol_cost).unwrap();
+        
+        // Emit buy event
+        emit!(TradeEvent {
+            mint: ctx.accounts.mint.key(),
+            user: ctx.accounts.user.key(),
+            is_buy: true,
+            token_amount: amount,
+            sol_amount: sol_cost,
+            fee,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Sell tokens to bonding curve
+    pub fn sell(
+        ctx: Context<Sell>,
+        amount: u64,
+        min_sol_output: u64,
+    ) -> Result<()> {
+        require!(amount > 0, ErrorCode::InvalidAmount);
+        require!(!ctx.accounts.bonding_curve.complete, ErrorCode::BondingCurveComplete);
+        
+        let bonding_curve = &mut ctx.accounts.bonding_curve;
+        
+        // Calculate SOL output using bonding curve formula
+        let sol_output = bonding_curve.calculate_sell_price(amount)?;
+        require!(sol_output >= min_sol_output, ErrorCode::SlippageExceeded);
+        
+        // Calculate fee
+        let global = &ctx.accounts.global;
+        let fee = sol_output
+            .checked_mul(global.fee_basis_points as u64)
+            .unwrap()
+            .checked_div(10_000)
+            .unwrap();
+        let net_sol = sol_output.checked_sub(fee).unwrap();
+        
+        // Transfer tokens from user
+        let cpi_accounts = spl_token::Transfer {
+            from: ctx.accounts.user_token_account.to_account_info(),
+            to: ctx.accounts.bonding_curve_token_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            cpi_accounts,
+        );
+        spl_token::transfer(cpi_ctx, amount)?;
+        
+        // Transfer SOL to user
+        **ctx.accounts.bonding_curve.try_borrow_mut_lamports()? -= sol_output;
+        **ctx.accounts.user.try_borrow_mut_lamports()? += net_sol;
+        **ctx.accounts.fee_recipient.try_borrow_mut_lamports()? += fee;
+        
+        // Update bonding curve state
+        bonding_curve.virtual_sol_reserves = bonding_curve
+            .virtual_sol_reserves
+            .checked_sub(net_sol)
+            .unwrap();
+        bonding_curve.virtual_token_reserves = bonding_curve
+            .virtual_token_reserves
+            .checked_add(amount)
+            .unwrap();
+        bonding_curve.real_sol_reserves = bonding_curve
+            .real_sol_reserves
+            .checked_sub(net_sol)
+            .unwrap();
+        bonding_curve.real_token_reserves = bonding_curve
+            .real_token_reserves
+            .checked_add(amount)
+            .unwrap();
+        
+        // Update global volume
+        let global = &mut ctx.accounts.global;
+        global.total_volume = global.total_volume.checked_add(sol_output).unwrap();
+        
+        // Emit sell event
+        emit!(TradeEvent {
+            mint: ctx.accounts.mint.key(),
+            user: ctx.accounts.user.key(),
+            is_buy: false,
+            token_amount: amount,
+            sol_amount: sol_output,
+            fee,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Migrate to Raydium when bonding curve is complete
+    pub fn migrate_to_raydium(ctx: Context<MigrateToRaydium>) -> Result<()> {
+        let bonding_curve = &mut ctx.accounts.bonding_curve;
+        
+        require!(
+            bonding_curve.real_sol_reserves >= ctx.accounts.global.migration_threshold,
+            ErrorCode::NotReadyForMigration
+        );
+        require!(!bonding_curve.complete, ErrorCode::AlreadyMigrated);
+        
+        // Create Raydium pool
+        // This is simplified - actual implementation would create AMM pool
+        bonding_curve.complete = true;
+        bonding_curve.migrated_at = Some(Clock::get()?.unix_timestamp);
+        
+        emit!(MigrationEvent {
+            mint: ctx.accounts.mint.key(),
+            sol_amount: bonding_curve.real_sol_reserves,
+            token_amount: bonding_curve.real_token_reserves,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+}
+
+// ============================================
+// Account Structures
+// ============================================
+
+#[account]
+pub struct Global {
+    pub authority: Pubkey,
+    pub fee_recipient: Pubkey,
+    pub fee_basis_points: u16,
+    pub migration_threshold: u64,
+    pub total_tokens_created: u64,
+    pub total_volume: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(Default)]
+pub struct BondingCurve {
+    pub mint: Pubkey,
+    pub creator: Pubkey,
+    pub virtual_sol_reserves: u64,
+    pub virtual_token_reserves: u64,
+    pub real_sol_reserves: u64,
+    pub real_token_reserves: u64,
+    pub complete: bool,
+    pub created_at: i64,
+    pub migrated_at: Option<i64>,
+    pub bump: u8,
+}
+
+impl BondingCurve {
+    pub const LEN: usize = 8 + // discriminator
+        32 + // mint
+        32 + // creator
+        8 +  // virtual_sol_reserves
+        8 +  // virtual_token_reserves
+        8 +  // real_sol_reserves
+        8 +  // real_token_reserves
+        1 +  // complete
+        8 +  // created_at
+        9 +  // migrated_at (Option<i64>)
+        1;   // bump
+    
+    /// Calculate buy price using constant product formula: x * y = k
+    pub fn calculate_buy_price(&self, amount: u64) -> Result<u64> {
+        let k = (self.virtual_sol_reserves as u128)
+            .checked_mul(self.virtual_token_reserves as u128)
+            .unwrap();
+        
+        let new_virtual_token_reserves = self.virtual_token_reserves
+            .checked_sub(amount)
+            .ok_or(ErrorCode::InsufficientReserves)?;
+        
+        let new_virtual_sol_reserves = k
+            .checked_div(new_virtual_token_reserves as u128)
+            .unwrap();
+        
+        let sol_cost = new_virtual_sol_reserves
+            .checked_sub(self.virtual_sol_reserves as u128)
+            .unwrap();
+        
+        // Add 1 for rounding up (ensures sufficient SOL)
+        Ok((sol_cost as u64).checked_add(1).unwrap_or(u64::MAX))
+    }
+    
+    /// Calculate sell price using constant product formula
+    pub fn calculate_sell_price(&self, amount: u64) -> Result<u64> {
+        let k = (self.virtual_sol_reserves as u128)
+            .checked_mul(self.virtual_token_reserves as u128)
+            .unwrap();
+        
+        let new_virtual_token_reserves = self.virtual_token_reserves
+            .checked_add(amount)
+            .unwrap();
+        
+        let new_virtual_sol_reserves = k
+            .checked_div(new_virtual_token_reserves as u128)
+            .unwrap();
+        
+        let sol_output = (self.virtual_sol_reserves as u128)
+            .checked_sub(new_virtual_sol_reserves)
+            .unwrap();
+        
+        Ok(sol_output as u64)
+    }
+    
+    /// Get current token price in SOL
+    pub fn get_current_price(&self) -> f64 {
+        (self.virtual_sol_reserves as f64) / (self.virtual_token_reserves as f64)
+    }
+    
+    /// Get market cap in SOL
+    pub fn get_market_cap(&self) -> f64 {
+        self.get_current_price() * (self.real_token_reserves as f64)
+    }
+    
+    /// Get bonding curve progress percentage
+    pub fn get_progress(&self) -> f64 {
+        (self.real_sol_reserves as f64) / 100_000_000_000.0 * 100.0
+    }
+}
+
+// ============================================
+// Account Validation Structures
+// ============================================
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + Global::LEN,
+        seeds = [b"global"],
+        bump,
+    )]
+    pub global: Account<'info, Global>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(name: String, symbol: String, uri: String)]
+pub struct CreateToken<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+    
+    #[account(
+        init,
+        payer = creator,
+        mint::decimals = 6,
+        mint::authority = bonding_curve,
+    )]
+    pub mint: Account<'info, Mint>,
+    
+    #[account(
+        init,
+        payer = creator,
+        space = 8 + BondingCurve::LEN,
+        seeds = [b"bonding-curve", mint.key().as_ref()],
+        bump,
+    )]
+    pub bonding_curve: Account<'info, BondingCurve>,
+    
+    #[account(
+        init,
+        payer = creator,
+        associated_token::mint = mint,
+        associated_token::authority = bonding_curve,
+    )]
+    pub bonding_curve_token_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        seeds = [b"global"],
+        bump = global.bump,
+    )]
+    pub global: Account<'info, Global>,
+    
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct Buy<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = user,
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        seeds = [b"bonding-curve", mint.key().as_ref()],
+        bump = bonding_curve.bump,
+    )]
+    pub bonding_curve: Account<'info, BondingCurve>,
+    
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = bonding_curve,
+    )]
+    pub bonding_curve_token_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub mint: Account<'info, Mint>,
+    
+    #[account(
+        seeds = [b"global"],
+        bump = global.bump,
+    )]
+    pub global: Account<'info, Global>,
+    
+    /// CHECK: Fee recipient account
+    #[account(mut, address = global.fee_recipient)]
+    pub fee_recipient: AccountInfo<'info>,
+    
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct Sell<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = user,
+    )]
+    pub user_token_account: Account<'info, TokenAccount>,
+    
+    #[account(
+        mut,
+        seeds = [b"bonding-curve", mint.key().as_ref()],
+        bump = bonding_curve.bump,
+    )]
+    pub bonding_curve: Account<'info, BondingCurve>,
+    
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = bonding_curve,
+    )]
+    pub bonding_curve_token_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub mint: Account<'info, Mint>,
+    
+    #[account(
+        seeds = [b"global"],
+        bump = global.bump,
+    )]
+    pub global: Account<'info, Global>,
+    
+    /// CHECK: Fee recipient account
+    #[account(mut, address = global.fee_recipient)]
+    pub fee_recipient: AccountInfo<'info>,
+    
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct MigrateToRaydium<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"bonding-curve", mint.key().as_ref()],
+        bump = bonding_curve.bump,
+    )]
+    pub bonding_curve: Account<'info, BondingCurve>,
+    
+    #[account(mut)]
+    pub mint: Account<'info, Mint>,
+    
+    #[account(
+        seeds = [b"global"],
+        bump = global.bump,
+    )]
+    pub global: Account<'info, Global>,
+    
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub raydium_program: Program<'info, RaydiumAmm>,
+}
+
+// ============================================
+// Instruction Parameters
+// ============================================
+
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub struct InitializeParams {
+    pub fee_recipient: Pubkey,
+    pub fee_basis_points: u16,
+    pub migration_threshold: u64,
+}
+
+// ============================================
+// Events
+// ============================================
+
+#[event]
+pub struct TokenCreatedEvent {
+    pub mint: Pubkey,
+    pub creator: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct TradeEvent {
+    pub mint: Pubkey,
+    pub user: Pubkey,
+    pub is_buy: bool,
+    pub token_amount: u64,
+    pub sol_amount: u64,
+    pub fee: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct MigrationEvent {
+    pub mint: Pubkey,
+    pub sol_amount: u64,
+    pub token_amount: u64,
+    pub timestamp: i64,
+}
+
+// ============================================
+// Error Codes
+// ============================================
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Name must be 32 characters or less")]
+    NameTooLong,
+    #[msg("Symbol must be 10 characters or less")]
+    SymbolTooLong,
+    #[msg("URI must be 200 characters or less")]
+    UriTooLong,
+    #[msg("Invalid amount")]
+    InvalidAmount,
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+    #[msg("Insufficient reserves")]
+    InsufficientReserves,
+    #[msg("Bonding curve is complete")]
+    BondingCurveComplete,
+    #[msg("Not ready for migration")]
+    NotReadyForMigration,
+    #[msg("Already migrated")]
+    AlreadyMigrated,
+}

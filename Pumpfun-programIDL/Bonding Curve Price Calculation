@@ -1,0 +1,120 @@
+// bonding_curve_math.rs
+use std::ops::{Add, Sub, Mul, Div};
+
+/// Bonding curve parameters
+#[derive(Debug, Clone, Copy)]
+pub struct BondingCurveParams {
+    pub initial_sol_reserves: u64,
+    pub initial_token_reserves: u64,
+}
+
+impl Default for BondingCurveParams {
+    fn default() -> Self {
+        Self {
+            initial_sol_reserves: 30_000_000_000, // 30 SOL in lamports
+            initial_token_reserves: 1_073_000_000_000, // ~1B tokens (with 6 decimals)
+        }
+    }
+}
+
+/// Calculate token price for a given bonding curve state
+pub fn calculate_price(
+    sol_reserves: u64,
+    token_reserves: u64,
+) -> f64 {
+    if token_reserves == 0 {
+        return f64::INFINITY;
+    }
+    (sol_reserves as f64) / (token_reserves as f64)
+}
+
+/// Calculate buy return: how many tokens for a given SOL amount
+pub fn calculate_buy_return(
+    sol_amount: u64,
+    sol_reserves: u64,
+    token_reserves: u64,
+) -> Option<u64> {
+    let k = (sol_reserves as u128).checked_mul(token_reserves as u128)?;
+    let new_sol_reserves = sol_reserves.checked_add(sol_amount)? as u128;
+    let new_token_reserves = k.checked_div(new_sol_reserves)?;
+    let tokens_out = (token_reserves as u128).checked_sub(new_token_reserves)?;
+    
+    Some(tokens_out as u64)
+}
+
+/// Calculate buy cost: how much SOL for a given token amount
+pub fn calculate_buy_cost(
+    token_amount: u64,
+    sol_reserves: u64,
+    token_reserves: u64,
+) -> Option<u64> {
+    let k = (sol_reserves as u128).checked_mul(token_reserves as u128)?;
+    let new_token_reserves = token_reserves.checked_sub(token_amount)? as u128;
+    let new_sol_reserves = k.checked_div(new_token_reserves)?;
+    let sol_cost = new_sol_reserves.checked_sub(sol_reserves as u128)?;
+    
+    Some(sol_cost as u64)
+}
+
+/// Calculate sell return: how much SOL for a given token amount
+pub fn calculate_sell_return(
+    token_amount: u64,
+    sol_reserves: u64,
+    token_reserves: u64,
+) -> Option<u64> {
+    let k = (sol_reserves as u128).checked_mul(token_reserves as u128)?;
+    let new_token_reserves = token_reserves.checked_add(token_amount)? as u128;
+    let new_sol_reserves = k.checked_div(new_token_reserves)?;
+    let sol_out = (sol_reserves as u128).checked_sub(new_sol_reserves)?;
+    
+    Some(sol_out as u64)
+}
+
+/// Calculate price impact for a given trade size
+pub fn calculate_price_impact_bps(
+    trade_amount: u64,
+    is_buy: bool,
+    sol_reserves: u64,
+    token_reserves: u64,
+) -> Option<u64> {
+    let current_price = calculate_price(sol_reserves, token_reserves);
+    
+    let new_price = if is_buy {
+        let cost = calculate_buy_cost(trade_amount, sol_reserves, token_reserves)?;
+        let new_sol_reserves = sol_reserves.checked_add(cost)?;
+        let new_token_reserves = token_reserves.checked_sub(trade_amount)?;
+        calculate_price(new_sol_reserves, new_token_reserves)
+    } else {
+        let output = calculate_sell_return(trade_amount, sol_reserves, token_reserves)?;
+        let new_sol_reserves = sol_reserves.checked_sub(output)?;
+        let new_token_reserves = token_reserves.checked_add(trade_amount)?;
+        calculate_price(new_sol_reserves, new_token_reserves)
+    };
+    
+    let impact = ((new_price - current_price) / current_price).abs();
+    Some((impact * 10000.0) as u64) // Return in basis points
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn test_bonding_curve_math() {
+        let sol_reserves = 30_000_000_000u64;
+        let token_reserves = 1_073_000_000_000u64;
+        
+        // Test buy
+        let token_amount = 1_000_000u64; // 1 token
+        let cost = calculate_buy_cost(token_amount, sol_reserves, token_reserves).unwrap();
+        assert!(cost > 0);
+        
+        // Test sell
+        let output = calculate_sell_return(token_amount, sol_reserves, token_reserves).unwrap();
+        assert!(output < cost); // Spread exists
+        
+        // Test price impact
+        let impact = calculate_price_impact_bps(token_amount, true, sol_reserves, token_reserves).unwrap();
+        assert!(impact < 100); // Less than 1% impact for small trade
+    }
+}
