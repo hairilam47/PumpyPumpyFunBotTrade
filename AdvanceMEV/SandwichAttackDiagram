@@ -1,0 +1,28 @@
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SANDWICH ATTACK DIAGRAM                              │
+│                                                                               │
+│  1. Victim submits buy transaction (pending in mempool)                       │
+│     ┌──────────────────────────────────────────┐                             │
+│     │  Victim TX: Buy 10 SOL worth of tokens   │                             │
+│     └──────────────────────────────────────────┘                             │
+│                         │                                                     │
+│                         ▼                                                     │
+│  2. Attacker sees victim's transaction                                        │
+│     ┌──────────────────────────────────────────┐                             │
+│     │  Attacker TX 1: Buy same token (frontrun)│                             │
+│     └──────────────────────────────────────────┘                             │
+│                         │                                                     │
+│                         ▼                                                     │
+│  3. Victim's transaction executes at higher price                             │
+│     ┌──────────────────────────────────────────┐                             │
+│     │  Victim TX: Executes at inflated price   │                             │
+│     └──────────────────────────────────────────┘                             │
+│                         │                                                     │
+│                         ▼                                                     │
+│  4. Attacker sells at profit (backrun)                                        │
+│     ┌──────────────────────────────────────────┐                             │
+│     │  Attacker TX 2: Sell for profit          │                             │
+│     └──────────────────────────────────────────┘                             │
+│                                                                               │
+│  Result: Attacker profits, Victim pays higher price                           │
+└─────────────────────────────────────────────────────────────────────────────┘
