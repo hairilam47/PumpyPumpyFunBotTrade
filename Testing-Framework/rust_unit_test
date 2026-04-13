@@ -1,0 +1,96 @@
+// tests/unit_test.rs
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_sdk::signature::Keypair;
+    use solana_program_test::*;
+
+    #[tokio::test]
+    async fn test_bonding_curve_calculations() {
+        let curve = BondingCurve {
+            virtual_sol_reserves: 30_000_000_000,
+            virtual_token_reserves: 1_073_000_000_000,
+            ..Default::default()
+        };
+        
+        // Test buy price calculation
+        let buy_amount = 1_000_000; // 1 token
+        let buy_price = curve.calculate_buy_price(buy_amount).unwrap();
+        
+        assert!(buy_price > 20_000 && buy_price < 30_000);
+        
+        // Test sell price calculation
+        let sell_amount = 1_000_000;
+        let sell_price = curve.calculate_sell_price(sell_amount).unwrap();
+        
+        // Sell price should be less than buy price (spread)
+        assert!(sell_price < buy_price);
+    }
+
+    #[tokio::test]
+    async fn test_order_validation() {
+        let order_manager = create_test_order_manager().await;
+        
+        let valid_order = Order {
+            mint: Pubkey::new_unique(),
+            amount: 1_000_000,
+            slippage_bps: 100,
+            ..Default::default()
+        };
+        
+        assert!(order_manager.validate_order(&valid_order).await.is_ok());
+        
+        let invalid_order = Order {
+            amount: 0,
+            ..valid_order.clone()
+        };
+        
+        assert!(order_manager.validate_order(&invalid_order).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sandwich_detection() {
+        let detector = SandwichDetector::new(create_test_mempool_monitor());
+        
+        let tx = create_test_transaction();
+        let mint = Pubkey::new_unique();
+        
+        let risk = detector.analyze_risk(&tx, &mint).await.unwrap();
+        
+        assert!(risk.score <= 100);
+        assert!(risk.optimal_slippage_bps >= 50);
+    }
+}
+
+// tests/integration_test.rs
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use solana_sdk::signer::Signer;
+    
+    #[tokio::test]
+    async fn test_full_trade_flow() {
+        // Setup test environment
+        let (mut context, user) = setup_test_env().await;
+        let mint = Keypair::new();
+        
+        // Create token
+        let create_tx = create_token_transaction(&user, &mint);
+        let result = context.banks_client.process_transaction(create_tx).await;
+        assert!(result.is_ok());
+        
+        // Buy token
+        let buy_tx = buy_token_transaction(&user, &mint.pubkey(), 1_000_000);
+        let result = context.banks_client.process_transaction(buy_tx).await;
+        assert!(result.is_ok());
+        
+        // Verify token balance
+        let balance = get_token_balance(&context, &user.pubkey(), &mint.pubkey()).await;
+        assert_eq!(balance, 1_000_000);
+        
+        // Sell token
+        let sell_tx = sell_token_transaction(&user, &mint.pubkey(), 1_000_000);
+        let result = context.banks_client.process_transaction(sell_tx).await;
+        assert!(result.is_ok());
+    }
+}
