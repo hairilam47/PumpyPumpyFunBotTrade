@@ -1,0 +1,254 @@
+// rpc_load_balancer.rs
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use rand::seq::SliceRandom;
+
+pub struct RpcLoadBalancer {
+    endpoints: Vec<RpcEndpoint>,
+    healthy_endpoints: Arc<RwLock<Vec<RpcEndpoint>>>,
+    metrics: Arc<RwLock<HashMap<String, EndpointMetrics>>>,
+    config: BalancerConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct RpcEndpoint {
+    pub url: String,
+    pub provider: RpcProvider,
+    pub priority: u8,
+    pub features: Vec<RpcFeature>,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RpcProvider {
+    Helius,
+    QuickNode,
+    Triton,
+    Alchemy,
+    GenesysGo,
+    Public,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RpcFeature {
+    WebSocket,
+    Geyser,
+    JitoBundles,
+    Archive,
+    LowLatency,
+}
+
+#[derive(Debug, Clone)]
+pub struct BalancerConfig {
+    pub health_check_interval: Duration,
+    pub max_latency_ms: u64,
+    pub min_success_rate: f64,
+    pub circuit_breaker_threshold: u32,
+}
+
+impl Default for BalancerConfig {
+    fn default() -> Self {
+        Self {
+            health_check_interval: Duration::from_secs(30),
+            max_latency_ms: 2000,
+            min_success_rate: 0.95,
+            circuit_breaker_threshold: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EndpointMetrics {
+    pub latency_samples: VecDeque<u64>,
+    pub success_count: u64,
+    pub failure_count: u64,
+    pub consecutive_failures: u32,
+    pub last_check: Instant,
+    pub is_circuit_open: bool,
+}
+
+impl RpcLoadBalancer {
+    pub fn new(endpoints: Vec<RpcEndpoint>) -> Self {
+        Self {
+            endpoints: endpoints.clone(),
+            healthy_endpoints: Arc::new(RwLock::new(endpoints)),
+            metrics: Arc::new(RwLock::new(HashMap::new())),
+            config: BalancerConfig::default(),
+        }
+    }
+    
+    /// Get the best available endpoint based on features and performance
+    pub async fn get_endpoint(
+        &self,
+        required_features: Vec<RpcFeature>,
+    ) -> Option<RpcEndpoint> {
+        let healthy = self.healthy_endpoints.read().await;
+        let metrics = self.metrics.read().await;
+        
+        let mut candidates: Vec<_> = healthy
+            .iter()
+            .filter(|ep| {
+                required_features.iter().all(|f| ep.features.contains(f))
+            })
+            .collect();
+        
+        // Sort by score (higher is better)
+        candidates.sort_by(|a, b| {
+            let score_a = self.calculate_score(a, &metrics);
+            let score_b = self.calculate_score(b, &metrics);
+            score_b.partial_cmp(&score_a).unwrap()
+        });
+        
+        candidates.first().map(|&ep| ep.clone())
+    }
+    
+    /// Get multiple endpoints (for redundancy)
+    pub async fn get_endpoints(
+        &self,
+        count: usize,
+        required_features: Vec<RpcFeature>,
+    ) -> Vec<RpcEndpoint> {
+        let healthy = self.healthy_endpoints.read().await;
+        let metrics = self.metrics.read().await;
+        
+        let mut candidates: Vec<_> = healthy
+            .iter()
+            .filter(|ep| {
+                required_features.iter().all(|f| ep.features.contains(f))
+            })
+            .collect();
+        
+        candidates.sort_by(|a, b| {
+            let score_a = self.calculate_score(a, &metrics);
+            let score_b = self.calculate_score(b, &metrics);
+            score_b.partial_cmp(&score_a).unwrap()
+        });
+        
+        candidates
+            .into_iter()
+            .take(count)
+            .cloned()
+            .collect()
+    }
+    
+    fn calculate_score(
+        &self,
+        endpoint: &RpcEndpoint,
+        metrics: &HashMap<String, EndpointMetrics>,
+    ) -> f64 {
+        let metric = metrics.get(&endpoint.url);
+        
+        let latency_score = if let Some(m) = metric {
+            let avg_latency = m.latency_samples.iter().sum::<u64>() /
+                m.latency_samples.len().max(1) as u64;
+            1.0 / (avg_latency as f64 / 1000.0 + 1.0)
+        } else {
+            0.5
+        };
+        
+        let success_score = metric
+            .map(|m| {
+                let total = m.success_count + m.failure_count;
+                if total == 0 {
+                    1.0
+                } else {
+                    m.success_count as f64 / total as f64
+                }
+            })
+            .unwrap_or(1.0);
+        
+        let priority_score = endpoint.priority as f64 / 10.0;
+        
+        // Weighted average
+        (latency_score * 0.5) + (success_score * 0.3) + (priority_score * 0.2)
+    }
+    
+    /// Health check loop
+    pub async fn start_health_checks(&self) {
+        let endpoints = self.endpoints.clone();
+        let healthy = self.healthy_endpoints.clone();
+        let metrics = self.metrics.clone();
+        let config = self.config.clone();
+        
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(config.health_check_interval);
+            
+            loop {
+                interval.tick().await;
+                
+                for endpoint in &endpoints {
+                    let is_healthy = Self::check_endpoint_health(endpoint).await;
+                    
+                    let mut healthy_list = healthy.write().await;
+                    let mut metrics_map = metrics.write().await;
+                    
+                    let metric = metrics_map
+                        .entry(endpoint.url.clone())
+                        .or_insert(EndpointMetrics {
+                            last_check: Instant::now(),
+                            ..Default::default()
+                        });
+                    
+                    if is_healthy {
+                        metric.success_count += 1;
+                        metric.consecutive_failures = 0;
+                        metric.is_circuit_open = false;
+                        
+                        if !healthy_list.iter().any(|ep| ep.url == endpoint.url) {
+                            healthy_list.push(endpoint.clone());
+                        }
+                    } else {
+                        metric.failure_count += 1;
+                        metric.consecutive_failures += 1;
+                        
+                        if metric.consecutive_failures >= config.circuit_breaker_threshold {
+                            metric.is_circuit_open = true;
+                        }
+                        
+                        healthy_list.retain(|ep| ep.url != endpoint.url);
+                    }
+                    
+                    metric.last_check = Instant::now();
+                }
+            }
+        });
+    }
+    
+    async fn check_endpoint_health(endpoint: &RpcEndpoint) -> bool {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build();
+        
+        if let Ok(client) = client {
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getHealth",
+            });
+            
+            if let Ok(response) = client
+                .post(&endpoint.url)
+                .json(&payload)
+                .send()
+                .await
+            {
+                return response.status().is_success();
+            }
+        }
+        
+        false
+    }
+    
+    /// Record latency for an endpoint
+    pub async fn record_latency(&self, url: &str, latency: Duration) {
+        let mut metrics = self.metrics.write().await;
+        if let Some(metric) = metrics.get_mut(url) {
+            metric.latency_samples.push_back(latency.as_millis() as u64);
+            if metric.latency_samples.len() > 100 {
+                metric.latency_samples.pop_front();
+            }
+        }
+    }
+}

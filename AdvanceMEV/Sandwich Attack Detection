@@ -1,0 +1,219 @@
+// sandwich_detector.rs
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+
+pub struct SandwichDetector {
+    mempool_monitor: Arc<MempoolMonitor>,
+    analysis_cache: Arc<RwLock<HashMap<String, CachedAnalysis>>>,
+    config: SandwichConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct SandwichConfig {
+    pub max_price_impact_bps: u64,
+    pub min_profit_threshold_sol: f64,
+    pub monitoring_window_secs: u64,
+    pub max_sandwich_risk_score: u32,
+}
+
+impl Default for SandwichConfig {
+    fn default() -> Self {
+        Self {
+            max_price_impact_bps: 500, // 5%
+            min_profit_threshold_sol: 0.01,
+            monitoring_window_secs: 5,
+            max_sandwich_risk_score: 70,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SandwichRisk {
+    pub score: u32,
+    pub frontrun_transactions: Vec<TransactionInfo>,
+    pub backrun_transactions: Vec<TransactionInfo>,
+    pub recommended_action: RiskAction,
+    pub optimal_slippage_bps: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum RiskAction {
+    Proceed,
+    IncreaseSlippage,
+    Delay,
+    Cancel,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransactionInfo {
+    pub signature: String,
+    pub signer: Pubkey,
+    pub program_id: Pubkey,
+    pub accounts: Vec<Pubkey>,
+    pub compute_units: u32,
+    pub priority_fee: u64,
+    pub timestamp: Instant,
+}
+
+impl SandwichDetector {
+    pub fn new(mempool_monitor: Arc<MempoolMonitor>) -> Self {
+        Self {
+            mempool_monitor,
+            analysis_cache: Arc::new(RwLock::new(HashMap::new())),
+            config: SandwichConfig::default(),
+        }
+    }
+    
+    /// Analyze sandwich attack risk for a given transaction
+    pub async fn analyze_risk(
+        &self,
+        our_tx: &Transaction,
+        mint: &Pubkey,
+    ) -> Result<SandwichRisk, SandwichError> {
+        let pending_txs = self.mempool_monitor.get_pending_transactions().await?;
+        
+        let mut risk = SandwichRisk {
+            score: 0,
+            frontrun_transactions: Vec::new(),
+            backrun_transactions: Vec::new(),
+            recommended_action: RiskAction::Proceed,
+            optimal_slippage_bps: 100, // Default 1%
+        };
+        
+        // Analyze each pending transaction
+        for tx_info in pending_txs {
+            // Check if transaction targets same token
+            if !self.targets_same_token(&tx_info, mint) {
+                continue;
+            }
+            
+            // Check if transaction is a frontrun
+            if self.is_frontrun_candidate(&tx_info, our_tx) {
+                risk.score += self.calculate_frontrun_score(&tx_info);
+                risk.frontrun_transactions.push(tx_info.clone());
+            }
+            
+            // Check if transaction is a backrun
+            if self.is_backrun_candidate(&tx_info, our_tx) {
+                risk.score += self.calculate_backrun_score(&tx_info);
+                risk.backrun_transactions.push(tx_info);
+            }
+        }
+        
+        // Cap score at 100
+        risk.score = risk.score.min(100);
+        
+        // Determine recommended action
+        risk.recommended_action = match risk.score {
+            0..=30 => RiskAction::Proceed,
+            31..=60 => RiskAction::IncreaseSlippage,
+            61..=80 => RiskAction::Delay,
+            _ => RiskAction::Cancel,
+        };
+        
+        // Calculate optimal slippage
+        risk.optimal_slippage_bps = self.calculate_optimal_slippage(&risk);
+        
+        // Cache analysis result
+        let cache_key = format!("{}_{}", mint, our_tx.signatures[0]);
+        self.analysis_cache.write().await.insert(
+            cache_key,
+            CachedAnalysis {
+                risk: risk.clone(),
+                timestamp: Instant::now(),
+            },
+        );
+        
+        Ok(risk)
+    }
+    
+    fn targets_same_token(&self, tx_info: &TransactionInfo, mint: &Pubkey) -> bool {
+        // Check if any account in the transaction is the token mint
+        tx_info.accounts.contains(mint)
+            || tx_info.program_id == crate::constants::PUMPFUN_PROGRAM_ID
+    }
+    
+    fn is_frontrun_candidate(&self, tx_info: &TransactionInfo, our_tx: &Transaction) -> bool {
+        // Higher priority fee indicates frontrunning attempt
+        let our_priority_fee = self.extract_priority_fee(our_tx);
+        
+        tx_info.priority_fee > our_priority_fee * 2
+            || tx_info.compute_units > 1_400_000 // High compute units
+    }
+    
+    fn is_backrun_candidate(&self, tx_info: &TransactionInfo, our_tx: &Transaction) -> bool {
+        // Check if transaction would profit from our price impact
+        // This requires simulating both transactions
+        false // Placeholder
+    }
+    
+    fn calculate_frontrun_score(&self, tx_info: &TransactionInfo) -> u32 {
+        let mut score = 0;
+        
+        // High priority fee
+        if tx_info.priority_fee > 1_000_000 {
+            score += 20;
+        } else if tx_info.priority_fee > 500_000 {
+            score += 10;
+        }
+        
+        // High compute units (complex transaction)
+        if tx_info.compute_units > 1_000_000 {
+            score += 15;
+        }
+        
+        // Known MEV bot signatures (would check against known patterns)
+        // ...
+        
+        score
+    }
+    
+    fn calculate_backrun_score(&self, tx_info: &TransactionInfo) -> u32 {
+        // Similar scoring for backrun transactions
+        0
+    }
+    
+    fn calculate_optimal_slippage(&self, risk: &SandwichRisk) -> u64 {
+        let base_slippage = 100; // 1%
+        
+        let risk_multiplier = match risk.score {
+            0..=30 => 1.0,
+            31..=60 => 2.0,
+            61..=80 => 3.0,
+            _ => 5.0,
+        };
+        
+        let frontrun_count_multiplier = 1.0 + (risk.frontrun_transactions.len() as f64 * 0.5);
+        
+        ((base_slippage as f64) * risk_multiplier * frontrun_count_multiplier) as u64
+    }
+    
+    fn extract_priority_fee(&self, tx: &Transaction) -> u64 {
+        // Extract compute unit price from transaction
+        for ix in &tx.message.instructions {
+            if ix.program_id == solana_sdk::compute_budget::id() {
+                // Parse compute unit price
+                if ix.data.len() >= 9 && ix.data[0] == 3 {
+                    return u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
+                }
+            }
+        }
+        0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CachedAnalysis {
+    risk: SandwichRisk,
+    timestamp: Instant,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SandwichError {
+    #[error("Mempool error: {0}")]
+    MempoolError(String),
+    #[error("Analysis timeout")]
+    Timeout,
+}

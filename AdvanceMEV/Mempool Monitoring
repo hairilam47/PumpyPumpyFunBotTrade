@@ -1,0 +1,92 @@
+// mempool_monitor.rs
+use std::collections::VecDeque;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+pub struct MempoolMonitor {
+    pending_transactions: Arc<RwLock<VecDeque<TransactionInfo>>>,
+    max_cache_size: usize,
+    grpc_client: Option<GeyserClient>,
+    websocket_client: Option<WebSocketClient>,
+}
+
+impl MempoolMonitor {
+    pub fn new() -> Self {
+        Self {
+            pending_transactions: Arc::new(RwLock::new(VecDeque::with_capacity(1000))),
+            max_cache_size: 1000,
+            grpc_client: None,
+            websocket_client: None,
+        }
+    }
+    
+    /// Initialize with gRPC streaming (recommended for production)
+    pub async fn with_grpc(mut self, endpoint: String) -> Result<Self, MempoolError> {
+        self.grpc_client = Some(GeyserClient::connect(endpoint).await?);
+        self.start_grpc_stream().await?;
+        Ok(self)
+    }
+    
+    /// Initialize with WebSocket (fallback)
+    pub async fn with_websocket(mut self, endpoint: String) -> Result<Self, MempoolError> {
+        self.websocket_client = Some(WebSocketClient::connect(endpoint).await?);
+        self.start_ws_stream().await?;
+        Ok(self)
+    }
+    
+    async fn start_grpc_stream(&self) -> Result<(), MempoolError> {
+        let client = self.grpc_client.as_ref().unwrap();
+        let pending_txs = self.pending_transactions.clone();
+        let max_size = self.max_cache_size;
+        
+        let mut stream = client.subscribe_transactions().await?;
+        
+        tokio::spawn(async move {
+            while let Some(tx_update) = stream.next().await {
+                if let Ok(tx) = tx_update {
+                    let tx_info = TransactionInfo::from_grpc_update(&tx);
+                    
+                    let mut cache = pending_txs.write().await;
+                    cache.push_back(tx_info);
+                    
+                    // Maintain max size
+                    while cache.len() > max_size {
+                        cache.pop_front();
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+    
+    async fn start_ws_stream(&self) -> Result<(), MempoolError> {
+        // Similar WebSocket implementation
+        Ok(())
+    }
+    
+    pub async fn get_pending_transactions(&self) -> Result<Vec<TransactionInfo>, MempoolError> {
+        let cache = self.pending_transactions.read().await;
+        Ok(cache.iter().cloned().collect())
+    }
+    
+    pub async fn get_transactions_for_program(
+        &self,
+        program_id: &Pubkey,
+    ) -> Result<Vec<TransactionInfo>, MempoolError> {
+        let cache = self.pending_transactions.read().await;
+        Ok(cache
+            .iter()
+            .filter(|tx| tx.program_id == *program_id)
+            .cloned()
+            .collect())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MempoolError {
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+    #[error("Stream error: {0}")]
+    StreamError(String),
+}

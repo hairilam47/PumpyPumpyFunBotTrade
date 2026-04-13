@@ -1,0 +1,173 @@
+// jito_client.rs
+use serde_json::json;
+use solana_sdk::{
+    signature::Keypair,
+    signer::Signer,
+    transaction::Transaction,
+};
+use std::time::{Duration, SystemTime};
+
+pub struct JitoClient {
+    client: reqwest::Client,
+    bundle_url: String,
+    tip_accounts: Vec<Pubkey>,
+}
+
+impl JitoClient {
+    pub fn new(bundle_url: String) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
+            bundle_url,
+            tip_accounts: Self::get_tip_accounts(),
+        }
+    }
+    
+    fn get_tip_accounts() -> Vec<Pubkey> {
+        vec![
+            pubkey!("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"),
+            pubkey!("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe"),
+            pubkey!("Cw8CFyM9FkoMi7K7HGfPNHMQYu5mRMN38dXQtVTXCtc"),
+            pubkey!("ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49"),
+            pubkey!("DfXygSm4jCyZKBbCfVSH7gZPEoeyxSXrjmZtQ28wLt5E"),
+            pubkey!("ADuUkR4vqLUMWXxW9gh6D6yr8bWkDqKCiZi2iT1wRZD9"),
+            pubkey!("DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL"),
+            pubkey!("3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnfKZKYx"),
+        ]
+    }
+    
+    /// Send a bundle of transactions to Jito
+    pub async fn send_bundle(
+        &self,
+        transactions: Vec<Transaction>,
+    ) -> Result<String, JitoError> {
+        let encoded_txs: Vec<String> = transactions
+            .iter()
+            .map(|tx| {
+                let serialized = bincode::serialize(tx)?;
+                Ok(base64::encode(serialized))
+            })
+            .collect::<Result<_, JitoError>>()?;
+        
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendBundle",
+            "params": [encoded_txs]
+        });
+        
+        let response = self.client
+            .post(&self.bundle_url)
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await?;
+        
+        let result: serde_json::Value = response.json().await?;
+        
+        if let Some(error) = result.get("error") {
+            return Err(JitoError::BundleError(error.to_string()));
+        }
+        
+        Ok(result["result"].as_str().unwrap_or("").to_string())
+    }
+    
+    /// Create a tip transaction for MEV protection
+    pub fn create_tip_transaction(
+        &self,
+        from_keypair: &Keypair,
+        recent_blockhash: Hash,
+        tip_amount_lamports: u64,
+    ) -> Transaction {
+        let tip_account = self.select_random_tip_account();
+        
+        let transfer_ix = solana_sdk::system_instruction::transfer(
+            &from_keypair.pubkey(),
+            &tip_account,
+            tip_amount_lamports,
+        );
+        
+        Transaction::new_signed_with_payer(
+            &[transfer_ix],
+            Some(&from_keypair.pubkey()),
+            &[from_keypair],
+            recent_blockhash,
+        )
+    }
+    
+    /// Send MEV-protected transaction with tip
+    pub async fn send_protected_transaction(
+        &self,
+        main_tx: Transaction,
+        signer: &Keypair,
+        recent_blockhash: Hash,
+        tip_percent: f64,
+    ) -> Result<String, JitoError> {
+        // Calculate tip amount (minimum 10000 lamports)
+        let tip_amount = (1_000_000_000f64 * tip_percent) as u64;
+        let tip_amount = tip_amount.max(10_000);
+        
+        // Create tip transaction
+        let tip_tx = self.create_tip_transaction(signer, recent_blockhash, tip_amount);
+        
+        // Send as bundle
+        self.send_bundle(vec![tip_tx, main_tx]).await
+    }
+    
+    fn select_random_tip_account(&self) -> Pubkey {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        *self.tip_accounts.choose(&mut rng).unwrap()
+    }
+    
+    /// Get bundle status
+    pub async fn get_bundle_status(
+        &self,
+        bundle_id: &str,
+    ) -> Result<BundleStatus, JitoError> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getBundleStatuses",
+            "params": [[bundle_id]]
+        });
+        
+        let response = self.client
+            .post(&self.bundle_url)
+            .json(&payload)
+            .send()
+            .await?;
+        
+        let result: serde_json::Value = response.json().await?;
+        
+        // Parse status
+        Ok(BundleStatus::from_json(&result)?)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum BundleStatus {
+    Pending,
+    Processed,
+    Confirmed,
+    Failed(String),
+}
+
+impl BundleStatus {
+    fn from_json(value: &serde_json::Value) -> Result<Self, JitoError> {
+        // Implementation
+        Ok(BundleStatus::Processed)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JitoError {
+    #[error("HTTP error: {0}")]
+    HttpError(#[from] reqwest::Error),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] bincode::Error),
+    #[error("Bundle error: {0}")]
+    BundleError(String),
+}
