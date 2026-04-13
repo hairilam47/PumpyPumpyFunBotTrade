@@ -1,0 +1,154 @@
+pumpfun-bot/
+├── execution-engine/           # Rust execution engine
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── src/
+│   │   ├── main.rs
+│   │   ├── lib.rs
+│   │   ├── rpc/
+│   │   │   ├── mod.rs
+│   │   │   ├── client.rs
+│   │   │   ├── manager.rs
+│   │   │   └── websocket.rs
+│   │   ├── pumpfun/
+│   │   │   ├── mod.rs
+│   │   │   ├── instructions.rs
+│   │   │   ├── accounts.rs
+│   │   │   └── bonding_curve.rs
+│   │   ├── transaction/
+│   │   │   ├── mod.rs
+│   │   │   ├── builder.rs
+│   │   │   └── signer.rs
+│   │   ├── mev/
+│   │   │   ├── mod.rs
+│   │   │   ├── jito.rs
+│   │   │   ├── sandwich.rs
+│   │   │   └── mempool.rs
+│   │   ├── order/
+│   │   │   ├── mod.rs
+│   │   │   ├── manager.rs
+│   │   │   └── types.rs
+│   │   ├── metrics/
+│   │   │   └── mod.rs
+│   │   └── grpc/
+│   │       ├── mod.rs
+│   │       └── server.rs
+│   ├── proto/
+│   │   └── bot.proto
+│   ├── tests/
+│   │   ├── integration_test.rs
+│   │   └── unit_test.rs
+│   └── Dockerfile
+│
+├── go-executor/                # Go execution engine (alternative)
+│   ├── go.mod
+│   ├── go.sum
+│   ├── cmd/
+│   │   └── bot/
+│   │       └── main.go
+│   ├── internal/
+│   │   ├── solana/
+│   │   ├── pumpfun/
+│   │   ├── mev/
+│   │   ├── grpc/
+│   │   └── metrics/
+│   ├── pkg/
+│   │   └── types/
+│   └── Dockerfile
+│
+├── strategy-engine/            # Python strategy engine
+│   ├── requirements.txt
+│   ├── setup.py
+│   ├── main.py
+│   ├── strategies/
+│   │   ├── __init__.py
+│   │   ├── base.py
+│   │   ├── sniper.py
+│   │   ├── momentum.py
+│   │   ├── arbitrage.py
+│   │   └── grid.py
+│   ├── analytics/
+│   │   ├── __init__.py
+│   │   ├── data_collector.py
+│   │   ├── ml_signals.py
+│   │   ├── backtester.py
+│   │   ├── indicators.py
+│   │   └── risk_manager.py
+│   ├── grpc_client/
+│   │   ├── __init__.py
+│   │   ├── client.py
+│   │   └── async_client.py
+│   ├── models/
+│   │   ├── price_predictor.pkl
+│   │   ├── rugpull_detector.pkl
+│   │   └── sentiment_analyzer.pkl
+│   ├── config/
+│   │   ├── dev.yaml
+│   │   ├── staging.yaml
+│   │   └── prod.yaml
+│   └── Dockerfile
+│
+├── database/                   # Database migrations
+│   ├── migrations/
+│   │   ├── 001_initial_schema.sql
+│   │   ├── 002_token_metrics.sql
+│   │   ├── 003_orders.sql
+│   │   └── 004_positions.sql
+│   └── seeds/
+│       └── dev_data.sql
+│
+├── monitoring/                 # Monitoring configuration
+│   ├── prometheus/
+│   │   ├── prometheus.yml
+│   │   └── alerts.yml
+│   ├── grafana/
+│   │   ├── dashboards/
+│   │   │   ├── bot-overview.json
+│   │   │   ├── trading-performance.json
+│   │   │   └── system-metrics.json
+│   │   └── datasources/
+│   │       └── datasources.yml
+│   ├── loki/
+│   │   └── loki-config.yaml
+│   └── promtail/
+│       └── promtail-config.yaml
+│
+├── terraform/                  # Infrastructure as Code
+│   ├── main.tf
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── provider.tf
+│   ├── backend.tf
+│   ├── terraform.tfvars.example
+│   ├── modules/
+│   │   ├── networking/
+│   │   ├── compute/
+│   │   ├── database/
+│   │   └── monitoring/
+│   ├── environments/
+│   │   ├── dev/
+│   │   ├── staging/
+│   │   └── prod/
+│   └── templates/
+│       └── user_data.sh
+│
+├── tests/                      # End-to-end tests
+│   ├── e2e/
+│   │   ├── test_trade_flow.py
+│   │   ├── test_mev_protection.py
+│   │   └── test_failover.py
+│   └── load/
+│       └── k6-load-test.js
+│
+├── scripts/                    # Utility scripts
+│   ├── deploy.sh
+│   ├── backup.sh
+│   ├── restore.sh
+│   └── health_check.sh
+│
+├── docker-compose.yml          # Local development
+├── docker-compose.prod.yml     # Production deployment
+├── Makefile                    # Build automation
+├── .env.example                # Environment variables template
+├── .gitignore
+└── README.md

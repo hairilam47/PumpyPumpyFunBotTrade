@@ -1,0 +1,18 @@
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                 DATA FLOW                                    │
+│                                                                              │
+│  1. MARKET DATA INGESTION                                                    │
+│     WebSocket ──► Rust/Go ──► Redis ──► PostgreSQL                           │
+│                                                                              │
+│  2. TRADE SIGNAL GENERATION                                                  │
+│     PostgreSQL ──► Python ──► ML Models ──► Trade Signal                     │
+│                                                                              │
+│  3. ORDER EXECUTION                                                          │
+│     Python ──► gRPC ──► Rust/Go ──► Jito Bundle ──► Blockchain               │
+│                                                                              │
+│  4. POSITION MONITORING                                                      │
+│     Blockchain ──► Rust/Go ──► PostgreSQL ──► Python ──► Risk Check          │
+│                                                                              │
+│  5. METRICS & MONITORING                                                     │
+│     All Services ──► Prometheus ──► Grafana ──► Alerts                       │
+└─────────────────────────────────────────────────────────────────────────────┘
