@@ -1,0 +1,137 @@
+// config.rs
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::env;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Config {
+    pub environment: String,
+    pub database_url: String,
+    pub redis_url: String,
+    pub grpc_port: u16,
+    pub metrics_port: u16,
+    pub keypair_path: PathBuf,
+    pub rpc_endpoints: Vec<RpcEndpointConfig>,
+    pub jito_bundle_url: Option<String>,
+    pub execution_workers: usize,
+    pub max_concurrent_orders: usize,
+    pub order_timeout_seconds: u64,
+    pub risk_limits: RiskLimits,
+    pub trading: TradingConfig,
+    pub monitoring: MonitoringConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RpcEndpointConfig {
+    pub url: String,
+    pub provider: String,
+    pub priority: u8,
+    pub features: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RiskLimits {
+    pub max_position_size_sol: f64,
+    pub max_portfolio_exposure_sol: f64,
+    pub max_daily_loss_sol: f64,
+    pub max_slippage_bps: u64,
+    pub max_sandwich_risk_score: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TradingConfig {
+    pub default_slippage_bps: u64,
+    pub min_trade_size_sol: f64,
+    pub max_trade_size_sol: f64,
+    pub mev_protection_enabled: bool,
+    pub tip_percentage: f64,
+    pub retry_attempts: u32,
+    pub retry_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MonitoringConfig {
+    pub log_level: String,
+    pub sentry_dsn: Option<String>,
+    pub slack_webhook_url: Option<String>,
+    pub alert_email: Option<String>,
+}
+
+impl Config {
+    pub fn from_env() -> Result<Self, config::ConfigError> {
+        let environment = env::var("ENVIRONMENT")
+            .unwrap_or_else(|_| "development".to_string());
+        
+        let config_path = format!("config/{}.yaml", environment);
+        
+        let config = config::Config::builder()
+            .add_source(config::File::with_name(&config_path).required(false))
+            .add_source(config::Environment::with_prefix("PUMPFUN").separator("__"))
+            .build()?;
+        
+        config.try_deserialize()
+    }
+    
+    pub fn validate(&self) -> Result<(), String> {
+        if self.database_url.is_empty() {
+            return Err("Database URL is required".to_string());
+        }
+        
+        if !self.keypair_path.exists() {
+            return Err(format!("Keypair file not found: {:?}", self.keypair_path));
+        }
+        
+        if self.rpc_endpoints.is_empty() {
+            return Err("At least one RPC endpoint is required".to_string());
+        }
+        
+        Ok(())
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            environment: "development".to_string(),
+            database_url: "postgresql://localhost:5432/pumpfun".to_string(),
+            redis_url: "redis://localhost:6379".to_string(),
+            grpc_port: 50051,
+            metrics_port: 9091,
+            keypair_path: PathBuf::from("keypair.json"),
+            rpc_endpoints: vec![
+                RpcEndpointConfig {
+                    url: "https://api.mainnet-beta.solana.com".to_string(),
+                    provider: "public".to_string(),
+                    priority: 1,
+                    features: vec!["websocket".to_string()],
+                }
+            ],
+            jito_bundle_url: None,
+            execution_workers: 4,
+            max_concurrent_orders: 10,
+            order_timeout_seconds: 30,
+            risk_limits: RiskLimits {
+                max_position_size_sol: 10.0,
+                max_portfolio_exposure_sol: 100.0,
+                max_daily_loss_sol: 5.0,
+                max_slippage_bps: 500,
+                max_sandwich_risk_score: 70,
+            },
+            trading: TradingConfig {
+                default_slippage_bps: 100,
+                min_trade_size_sol: 0.01,
+                max_trade_size_sol: 10.0,
+                mev_protection_enabled: true,
+                tip_percentage: 0.001,
+                retry_attempts: 3,
+                retry_delay_ms: 1000,
+            },
+            monitoring: MonitoringConfig {
+                log_level: "info".to_string(),
+                sentry_dsn: None,
+                slack_webhook_url: None,
+                alert_email: None,
+            },
+        }
+    }
+}

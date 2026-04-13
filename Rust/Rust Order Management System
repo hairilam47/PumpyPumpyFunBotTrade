@@ -1,0 +1,457 @@
+// order/manager.rs
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{RwLock, mpsc, Semaphore};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
+
+#[derive(Debug, Clone)]
+pub struct Order {
+    pub id: String,
+    pub mint: Pubkey,
+    pub order_type: OrderType,
+    pub side: OrderSide,
+    pub amount: u64,
+    pub price: Option<f64>,
+    pub max_cost: Option<u64>,
+    pub min_output: Option<u64>,
+    pub slippage_bps: u64,
+    pub status: OrderStatus,
+    pub strategy: String,
+    pub metadata: HashMap<String, String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub executed_at: Option<DateTime<Utc>>,
+    pub signature: Option<String>,
+    pub error: Option<String>,
+    pub retry_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderType {
+    Market,
+    Limit,
+    StopLoss,
+    TakeProfit,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderStatus {
+    Pending,
+    Validating,
+    Executing,
+    Executed,
+    Failed,
+    Cancelled,
+    Expired,
+}
+
+pub struct OrderManager {
+    db_pool: DatabasePool,
+    pumpfun_client: Arc<PumpFunClient>,
+    mev_protector: Arc<MevProtector>,
+    metrics: Arc<Metrics>,
+    
+    pending_orders: Arc<RwLock<VecDeque<Order>>>,
+    active_orders: Arc<RwLock<HashMap<String, Order>>>,
+    order_history: Arc<RwLock<HashMap<String, Order>>>,
+    
+    order_tx: mpsc::UnboundedSender<Order>,
+    order_rx: Arc<RwLock<mpsc::UnboundedReceiver<Order>>>,
+    
+    config: OrderConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderConfig {
+    pub max_pending_orders: usize,
+    pub order_timeout: Duration,
+    pub max_retries: u32,
+    pub retry_delay: Duration,
+}
+
+impl OrderManager {
+    pub fn new(
+        db_pool: DatabasePool,
+        pumpfun_client: Arc<PumpFunClient>,
+        mev_protector: Arc<MevProtector>,
+        metrics: Arc<Metrics>,
+        order_tx: mpsc::UnboundedSender<Order>,
+    ) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        
+        Self {
+            db_pool,
+            pumpfun_client,
+            mev_protector,
+            metrics,
+            pending_orders: Arc::new(RwLock::new(VecDeque::new())),
+            active_orders: Arc::new(RwLock::new(HashMap::new())),
+            order_history: Arc::new(RwLock::new(HashMap::new())),
+            order_tx,
+            order_rx: Arc::new(RwLock::new(rx)),
+            config: OrderConfig::default(),
+        }
+    }
+    
+    /// Submit a new order
+    pub async fn submit_order(&self, mut order: Order) -> Result<String, OrderError> {
+        // Validate order
+        self.validate_order(&order).await?;
+        
+        // Apply risk checks
+        self.risk_check(&order).await?;
+        
+        // Generate order ID
+        order.id = Uuid::new_v4().to_string();
+        order.status = OrderStatus::Pending;
+        order.created_at = Utc::now();
+        order.updated_at = Utc::now();
+        
+        // Store in database
+        self.store_order(&order).await?;
+        
+        // Add to pending queue
+        {
+            let mut pending = self.pending_orders.write().await;
+            if pending.len() >= self.config.max_pending_orders {
+                return Err(OrderError::QueueFull);
+            }
+            pending.push_back(order.clone());
+        }
+        
+        // Send to execution channel
+        self.order_tx.send(order.clone())?;
+        
+        // Update metrics
+        self.metrics.orders_submitted.inc();
+        
+        Ok(order.id.clone())
+    }
+    
+    /// Cancel an order
+    pub async fn cancel_order(&self, order_id: &str) -> Result<(), OrderError> {
+        // Remove from pending queue
+        {
+            let mut pending = self.pending_orders.write().await;
+            pending.retain(|o| o.id != order_id);
+        }
+        
+        // Remove from active orders
+        {
+            let mut active = self.active_orders.write().await;
+            if let Some(mut order) = active.remove(order_id) {
+                order.status = OrderStatus::Cancelled;
+                order.updated_at = Utc::now();
+                self.store_order(&order).await?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Execution worker
+    pub async fn execution_worker(&self, semaphore: Arc<Semaphore>) {
+        let mut rx = self.order_rx.write().await;
+        
+        while let Some(order) = rx.recv().await {
+            let _permit = semaphore.acquire().await.unwrap();
+            
+            let manager = self.clone();
+            let order_id = order.id.clone();
+            
+            tokio::spawn(async move {
+                let result = match order.order_type {
+                    OrderType::Market => {
+                        manager.execute_market_order(order).await
+                    }
+                    OrderType::Limit => {
+                        manager.execute_limit_order(order).await
+                    }
+                    _ => Ok(()),
+                };
+                
+                if let Err(e) = result {
+                    tracing::error!("Order {} failed: {}", order_id, e);
+                }
+            });
+        }
+    }
+    
+    /// Execute market order
+    async fn execute_market_order(&self, mut order: Order) -> Result<(), OrderError> {
+        let start = Instant::now();
+        
+        order.status = OrderStatus::Executing;
+        order.updated_at = Utc::now();
+        self.update_order(&order).await?;
+        
+        // Check MEV risk
+        let risk = self.mev_protector
+            .analyze_sandwich_risk(&order)
+            .await?;
+        
+        if risk.score > self.config.max_sandwich_risk {
+            self.metrics.orders_rejected.inc();
+            return Err(OrderError::SandwichRiskTooHigh(risk.score));
+        }
+        
+        // Execute based on side
+        let result = match order.side {
+            OrderSide::Buy => {
+                self.pumpfun_client
+                    .buy_token(
+                        &order.mint,
+                        order.amount,
+                        order.max_cost.unwrap(),
+                        order.slippage_bps,
+                    )
+                    .await
+            }
+            OrderSide::Sell => {
+                self.pumpfun_client
+                    .sell_token(
+                        &order.mint,
+                        order.amount,
+                        order.min_output.unwrap(),
+                        order.slippage_bps,
+                    )
+                    .await
+            }
+        };
+        
+        match result {
+            Ok(signature) => {
+                order.status = OrderStatus::Executed;
+                order.executed_at = Some(Utc::now());
+                order.signature = Some(signature);
+                
+                self.metrics.orders_executed.inc();
+                self.metrics.order_execution_time
+                    .observe(start.elapsed().as_secs_f64());
+            }
+            Err(e) => {
+                order.status = OrderStatus::Failed;
+                order.error = Some(e.to_string());
+                
+                self.metrics.orders_failed.inc();
+                
+                // Retry logic
+                if order.retry_count < self.config.max_retries {
+                    order.retry_count += 1;
+                    order.status = OrderStatus::Pending;
+                    
+                    tokio::time::sleep(self.config.retry_delay).await;
+                    self.order_tx.send(order.clone())?;
+                    
+                    return Ok(());
+                }
+            }
+        }
+        
+        order.updated_at = Utc::now();
+        self.update_order(&order).await?;
+        
+        // Archive completed order
+        {
+            let mut active = self.active_orders.write().await;
+            active.remove(&order.id);
+            
+            let mut history = self.order_history.write().await;
+            history.insert(order.id.clone(), order);
+        }
+        
+        Ok(())
+    }
+    
+    /// Execute limit order
+    async fn execute_limit_order(&self, order: Order) -> Result<(), OrderError> {
+        // Monitor price and execute when condition met
+        todo!()
+    }
+    
+    /// Validate order parameters
+    async fn validate_order(&self, order: &Order) -> Result<(), OrderError> {
+        if order.amount == 0 {
+            return Err(OrderError::InvalidAmount);
+        }
+        
+        if order.slippage_bps > 1000 {
+            return Err(OrderError::SlippageTooHigh);
+        }
+        
+        // Check if mint exists
+        if !self.pumpfun_client.token_exists(&order.mint).await? {
+            return Err(OrderError::TokenNotFound);
+        }
+        
+        Ok(())
+    }
+    
+    /// Apply risk management checks
+    async fn risk_check(&self, order: &Order) -> Result<(), OrderError> {
+        let limits = &self.config.risk_limits;
+        
+        // Check position size
+        let trade_value_sol = order.amount as f64 / 1e9;
+        if trade_value_sol > limits.max_position_size_sol {
+            return Err(OrderError::PositionSizeTooLarge);
+        }
+        
+        // Check portfolio exposure
+        let total_exposure = self.calculate_total_exposure().await?;
+        if total_exposure + trade_value_sol > limits.max_portfolio_exposure_sol {
+            return Err(OrderError::ExposureLimitExceeded);
+        }
+        
+        // Check daily loss limit
+        let daily_pnl = self.get_daily_pnl().await?;
+        if daily_pnl < -limits.max_daily_loss_sol {
+            return Err(OrderError::DailyLossLimitExceeded);
+        }
+        
+        Ok(())
+    }
+    
+    /// Store order in database
+    async fn store_order(&self, order: &Order) -> Result<(), OrderError> {
+        sqlx::query!(
+            r#"
+            INSERT INTO orders (
+                id, mint, order_type, side, amount, price,
+                max_cost, min_output, slippage_bps, status,
+                strategy, metadata, created_at, updated_at,
+                executed_at, signature, error, retry_count
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+            "#,
+            order.id,
+            order.mint.to_string(),
+            format!("{:?}", order.order_type),
+            format!("{:?}", order.side),
+            order.amount as i64,
+            order.price,
+            order.max_cost.map(|v| v as i64),
+            order.min_output.map(|v| v as i64),
+            order.slippage_bps as i32,
+            format!("{:?}", order.status),
+            order.strategy,
+            serde_json::to_value(&order.metadata)?,
+            order.created_at,
+            order.updated_at,
+            order.executed_at,
+            order.signature,
+            order.error,
+            order.retry_count as i32,
+        )
+        .execute(&self.db_pool.pool)
+        .await?;
+        
+        Ok(())
+    }
+    
+    /// Update order in database
+    async fn update_order(&self, order: &Order) -> Result<(), OrderError> {
+        sqlx::query!(
+            r#"
+            UPDATE orders
+            SET status = $1, updated_at = $2, executed_at = $3,
+                signature = $4, error = $5, retry_count = $6
+            WHERE id = $7
+            "#,
+            format!("{:?}", order.status),
+            order.updated_at,
+            order.executed_at,
+            order.signature,
+            order.error,
+            order.retry_count as i32,
+            order.id,
+        )
+        .execute(&self.db_pool.pool)
+        .await?;
+        
+        Ok(())
+    }
+    
+    /// Calculate total portfolio exposure
+    async fn calculate_total_exposure(&self) -> Result<f64, OrderError> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(amount * current_price), 0) as total_exposure
+            FROM positions
+            WHERE status = 'OPEN'
+            "#
+        )
+        .fetch_one(&self.db_pool.pool)
+        .await?;
+        
+        Ok(result.total_exposure.unwrap_or(0.0) as f64)
+    }
+    
+    /// Get daily PnL
+    async fn get_daily_pnl(&self) -> Result<f64, OrderError> {
+        let result = sqlx::query!(
+            r#"
+            SELECT COALESCE(SUM(pnl), 0) as daily_pnl
+            FROM trades
+            WHERE executed_at >= NOW() - INTERVAL '1 day'
+            "#
+        )
+        .fetch_one(&self.db_pool.pool)
+        .await?;
+        
+        Ok(result.daily_pnl.unwrap_or(0.0) as f64)
+    }
+}
+
+impl Default for OrderConfig {
+    fn default() -> Self {
+        Self {
+            max_pending_orders: 100,
+            order_timeout: Duration::from_secs(30),
+            max_retries: 3,
+            retry_delay: Duration::from_secs(1),
+            risk_limits: RiskLimits::default(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OrderError {
+    #[error("Invalid amount")]
+    InvalidAmount,
+    #[error("Slippage too high")]
+    SlippageTooHigh,
+    #[error("Token not found")]
+    TokenNotFound,
+    #[error("Position size too large")]
+    PositionSizeTooLarge,
+    #[error("Exposure limit exceeded")]
+    ExposureLimitExceeded,
+    #[error("Daily loss limit exceeded")]
+    DailyLossLimitExceeded,
+    #[error("Order queue full")]
+    QueueFull,
+    #[error("Sandwich risk too high: {0}")]
+    SandwichRiskTooHigh(u32),
+    #[error("Database error: {0}")]
+    DatabaseError(#[from] sqlx::Error),
+    #[error("RPC error: {0}")]
+    RpcError(#[from] Box<dyn std::error::Error>),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+    #[error("Channel send error")]
+    ChannelSendError,
+}
+
+impl<T> From<mpsc::error::SendError<T>> for OrderError {
+    fn from(_: mpsc::error::SendError<T>) -> Self {
+        OrderError::ChannelSendError
+    }
+}

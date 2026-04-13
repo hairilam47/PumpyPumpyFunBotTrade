@@ -1,0 +1,181 @@
+// grpc_server.rs
+use tonic::{Request, Response, Status};
+use std::sync::Arc;
+
+// Include generated protobuf code
+tonic::include_proto!("bot");
+
+pub struct BotService {
+    order_manager: Arc<OrderManager>,
+    pumpfun_client: Arc<PumpFunClient>,
+    metrics: Arc<Metrics>,
+}
+
+impl BotService {
+    pub fn new(
+        order_manager: Arc<OrderManager>,
+        pumpfun_client: Arc<PumpFunClient>,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            order_manager,
+            pumpfun_client,
+            metrics,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl bot_server::Bot for BotService {
+    async fn submit_order(
+        &self,
+        request: Request<SubmitOrderRequest>,
+    ) -> Result<Response<SubmitOrderResponse>, Status> {
+        let req = request.into_inner();
+        
+        let mint = Pubkey::from_str(&req.token_mint)
+            .map_err(|_| Status::invalid_argument("Invalid mint address"))?;
+        
+        let order = Order {
+            id: String::new(), // Will be generated
+            mint,
+            order_type: parse_order_type(&req.order_type)?,
+            side: parse_order_side(&req.side)?,
+            amount: req.amount,
+            price: req.price,
+            max_cost: req.max_sol_cost,
+            min_output: req.min_sol_output,
+            slippage_bps: req.slippage_bps,
+            status: OrderStatus::Pending,
+            strategy: req.strategy_name,
+            metadata: req.metadata,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            executed_at: None,
+            signature: None,
+            error: None,
+            retry_count: 0,
+        };
+        
+        let order_id = self.order_manager
+            .submit_order(order)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
+        Ok(Response::new(SubmitOrderResponse {
+            order_id,
+            success: true,
+            message: "Order submitted successfully".to_string(),
+        }))
+    }
+    
+    async fn cancel_order(
+        &self,
+        request: Request<CancelOrderRequest>,
+    ) -> Result<Response<CancelOrderResponse>, Status> {
+        let req = request.into_inner();
+        
+        self.order_manager
+            .cancel_order(&req.order_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
+        Ok(Response::new(CancelOrderResponse {
+            success: true,
+            message: "Order cancelled".to_string(),
+        }))
+    }
+    
+    async fn get_order_status(
+        &self,
+        request: Request<GetOrderStatusRequest>,
+    ) -> Result<Response<OrderStatusResponse>, Status> {
+        let req = request.into_inner();
+        
+        let order = self.order_manager
+            .get_order(&req.order_id)
+            .await
+            .map_err(|e| Status::not_found(e.to_string()))?;
+        
+        Ok(Response::new(OrderStatusResponse {
+            order_id: order.id,
+            status: format!("{:?}", order.status),
+            signature: order.signature.unwrap_or_default(),
+            error: order.error.unwrap_or_default(),
+            executed_at: order.executed_at.map(|dt| dt.to_rfc3339()),
+        }))
+    }
+    
+    async fn get_token_info(
+        &self,
+        request: Request<GetTokenInfoRequest>,
+    ) -> Result<Response<TokenInfoResponse>, Status> {
+        let req = request.into_inner();
+        
+        let mint = Pubkey::from_str(&req.token_mint)
+            .map_err(|_| Status::invalid_argument("Invalid mint address"))?;
+        
+        let info = self.pumpfun_client
+            .get_token_info(&mint)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
+        Ok(Response::new(TokenInfoResponse {
+            mint: info.mint.to_string(),
+            name: info.name,
+            symbol: info.symbol,
+            price: info.price,
+            liquidity_sol: info.liquidity_sol,
+            market_cap_sol: info.market_cap_sol,
+            volume_24h_sol: info.volume_24h_sol,
+            holder_count: info.holder_count,
+            bonding_curve_progress: info.bonding_curve_progress,
+        }))
+    }
+    
+    async fn get_portfolio_summary(
+        &self,
+        request: Request<Empty>,
+    ) -> Result<Response<PortfolioSummaryResponse>, Status> {
+        let summary = self.order_manager
+            .get_portfolio_summary()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        
+        Ok(Response::new(PortfolioSummaryResponse {
+            total_value_sol: summary.total_value_sol,
+            cash_balance_sol: summary.cash_balance_sol,
+            positions_value_sol: summary.positions_value_sol,
+            daily_pnl_sol: summary.daily_pnl_sol,
+            total_pnl_sol: summary.total_pnl_sol,
+            open_positions_count: summary.open_positions_count,
+            win_rate: summary.win_rate,
+        }))
+    }
+    
+    async fn stream_orders(
+        &self,
+        request: Request<StreamOrdersRequest>,
+    ) -> Result<tonic::Response<tonic::Streaming<OrderUpdate>>, Status> {
+        // Implementation for streaming order updates
+        todo!()
+    }
+}
+
+fn parse_order_type(s: &str) -> Result<OrderType, Status> {
+    match s {
+        "MARKET" => Ok(OrderType::Market),
+        "LIMIT" => Ok(OrderType::Limit),
+        "STOP_LOSS" => Ok(OrderType::StopLoss),
+        "TAKE_PROFIT" => Ok(OrderType::TakeProfit),
+        _ => Err(Status::invalid_argument("Invalid order type")),
+    }
+}
+
+fn parse_order_side(s: &str) -> Result<OrderSide, Status> {
+    match s {
+        "BUY" => Ok(OrderSide::Buy),
+        "SELL" => Ok(OrderSide::Sell),
+        _ => Err(Status::invalid_argument("Invalid order side")),
+    }
+}
