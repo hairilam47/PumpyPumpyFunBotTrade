@@ -1,0 +1,228 @@
+// main.rs
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{RwLock, mpsc, Semaphore};
+use tonic::transport::Server;
+use tracing::{info, error, warn, debug};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+mod config;
+mod rpc;
+mod pumpfun;
+mod transaction;
+mod websocket;
+mod mev;
+mod database;
+mod metrics;
+mod order;
+mod grpc_server;
+
+use config::Config;
+use database::DatabasePool;
+use metrics::Metrics;
+use order::OrderManager;
+use pumpfun::PumpFunClient;
+use mev::MevProtector;
+use rpc::RpcManager;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logging with JSON format for production
+    tracing_subscriber::registry()
+        .with(fmt::layer().json())
+        .with(EnvFilter::from_default_env())
+        .init();
+    
+    info!("Starting PumpFun Trading Bot v{}", env!("CARGO_PKG_VERSION"));
+    
+    // Load configuration
+    let config = Config::from_env()?;
+    info!("Loaded configuration for environment: {}", config.environment);
+    
+    // Initialize metrics registry
+    let metrics = Arc::new(Metrics::new()?);
+    
+    // Start metrics server
+    let metrics_server = metrics.clone();
+    tokio::spawn(async move {
+        metrics_server.start_server(9091).await;
+    });
+    
+    // Initialize database connection pool
+    let db_pool = DatabasePool::new(&config.database_url).await?;
+    info!("Connected to database");
+    
+    // Run database migrations
+    database::run_migrations(&db_pool).await?;
+    
+    // Initialize RPC manager with load balancing
+    let rpc_manager = Arc::new(RpcManager::new(config.rpc_endpoints.clone()).await?);
+    rpc_manager.start_health_checks();
+    info!("RPC manager initialized with {} endpoints", config.rpc_endpoints.len());
+    
+    // Initialize PumpFun client
+    let pumpfun_client = Arc::new(PumpFunClient::new(
+        rpc_manager.clone(),
+        config.keypair_path.clone(),
+    )?);
+    info!("PumpFun client initialized");
+    
+    // Initialize MEV protector
+    let mev_protector = Arc::new(MevProtector::new(
+        config.jito_bundle_url.clone(),
+        pumpfun_client.clone(),
+        metrics.clone(),
+    ));
+    info!("MEV protection initialized");
+    
+    // Initialize order manager
+    let (order_tx, order_rx) = mpsc::unbounded_channel();
+    let order_manager = Arc::new(OrderManager::new(
+        db_pool.clone(),
+        pumpfun_client.clone(),
+        mev_protector.clone(),
+        metrics.clone(),
+        order_tx,
+    ));
+    
+    // Start background tasks
+    start_background_tasks(
+        order_manager.clone(),
+        pumpfun_client.clone(),
+        metrics.clone(),
+        &config,
+    ).await;
+    
+    // Initialize gRPC server
+    let grpc_service = grpc_server::BotService::new(
+        order_manager.clone(),
+        pumpfun_client.clone(),
+        metrics.clone(),
+    );
+    
+    let grpc_addr = format!("0.0.0.0:{}", config.grpc_port).parse()?;
+    info!("Starting gRPC server on {}", grpc_addr);
+    
+    // Start gRPC server with graceful shutdown
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
+    
+    let server_handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(
+                tonic_health::pb::health_server::HealthServer::new(
+                    grpc_service.clone()
+                )
+            )
+            .add_service(
+                bot_proto::bot_server::BotServer::new(grpc_service)
+            )
+            .serve_with_shutdown(grpc_addr, async {
+                signal_rx.await.ok();
+                info!("gRPC server shutting down gracefully");
+            })
+            .await
+    });
+    
+    // Setup signal handlers
+    setup_signal_handlers(signal_tx);
+    
+    // Wait for server to finish
+    server_handle.await??;
+    
+    info!("PumpFun Trading Bot stopped");
+    Ok(())
+}
+
+async fn start_background_tasks(
+    order_manager: Arc<OrderManager>,
+    pumpfun_client: Arc<PumpFunClient>,
+    metrics: Arc<Metrics>,
+    config: &Config,
+) {
+    // Order execution worker pool
+    let worker_count = config.execution_workers;
+    let semaphore = Arc::new(Semaphore::new(worker_count));
+    
+    for i in 0..worker_count {
+        let manager = order_manager.clone();
+        let permit = semaphore.clone();
+        
+        tokio::spawn(async move {
+            info!("Starting execution worker {}", i);
+            manager.execution_worker(permit).await;
+        });
+    }
+    
+    // WebSocket monitor for new tokens
+    let ws_monitor = pumpfun_client.clone();
+    let order_mgr = order_manager.clone();
+    
+    tokio::spawn(async move {
+        info!("Starting WebSocket monitor");
+        if let Err(e) = ws_monitor.start_token_monitor(order_mgr).await {
+            error!("WebSocket monitor error: {}", e);
+        }
+    });
+    
+    // Position monitor
+    let position_monitor = order_manager.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            if let Err(e) = position_monitor.update_positions().await {
+                error!("Position update error: {}", e);
+            }
+        }
+    });
+    
+    // Metrics collection
+    let metrics_client = pumpfun_client.clone();
+    let metrics_registry = metrics.clone();
+    
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if let Err(e) = update_metrics(&metrics_client, &metrics_registry).await {
+                error!("Metrics update error: {}", e);
+            }
+        }
+    });
+    
+    // Database cleanup
+    let db_pool = order_manager.db_pool().clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            if let Err(e) = database::cleanup_old_data(&db_pool).await {
+                error!("Database cleanup error: {}", e);
+            }
+        }
+    });
+}
+
+fn setup_signal_handlers(signal_tx: tokio::sync::oneshot::Sender<()>) {
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for Ctrl+C");
+        
+        info!("Received shutdown signal");
+        let _ = signal_tx.send(());
+    });
+}
+
+async fn update_metrics(
+    client: &Arc<PumpFunClient>,
+    metrics: &Arc<Metrics>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Update various metrics
+    let balance = client.get_balance().await?;
+    metrics.wallet_balance.set(balance as f64 / 1e9);
+    
+    // More metric updates...
+    
+    Ok(())
+}
