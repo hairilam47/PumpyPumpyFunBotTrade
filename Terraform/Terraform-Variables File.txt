@@ -1,0 +1,129 @@
+# terraform/variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+  
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod"
+  }
+}
+
+variable "project_name" {
+  description = "Project name"
+  type        = string
+  default     = "pumpfun-bot"
+}
+
+variable "owner_email" {
+  description = "Owner email for tags"
+  type        = string
+}
+
+variable "alert_email" {
+  description = "Email for alerts"
+  type        = string
+}
+
+variable "admin_ip" {
+  description = "Admin IP for SSH access"
+  type        = string
+  default     = "0.0.0.0/0"
+}
+
+variable "vpc_cidr" {
+  description = "VPC CIDR block"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type per environment"
+  type        = map(string)
+  default = {
+    dev     = "t3.medium"
+    staging = "t3.large"
+    prod    = "c5.xlarge"
+  }
+}
+
+variable "bot_count" {
+  description = "Number of bot instances"
+  type        = number
+  default     = 1
+}
+
+variable "db_instance_class" {
+  description = "RDS instance class per environment"
+  type        = map(string)
+  default = {
+    dev     = "db.t3.small"
+    staging = "db.t3.medium"
+    prod    = "db.r5.large"
+  }
+}
+
+variable "db_name" {
+  description = "Database name"
+  type        = string
+  default     = "pumpfun"
+}
+
+variable "db_username" {
+  description = "Database username"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_password" {
+  description = "Database password"
+  type        = string
+  sensitive   = true
+}
+
+variable "helius_api_key" {
+  description = "Helius RPC API key"
+  type        = string
+  sensitive   = true
+}
+
+variable "quicknode_api_key" {
+  description = "QuickNode RPC API key"
+  type        = string
+  sensitive   = true
+}
+
+variable "wallet_private_key" {
+  description = "Solana wallet private key"
+  type        = string
+  sensitive   = true
+}
+
+variable "max_trade_size_sol" {
+  description = "Maximum trade size in SOL"
+  type        = number
+  default     = 10.0
+}
+
+variable "slippage_bps" {
+  description = "Default slippage in basis points"
+  type        = number
+  default     = 100
+}
+
+variable "jito_bundle_url" {
+  description = "Jito bundle URL"
+  type        = string
+  default     = ""
+}
+
+variable "certificate_arn" {
+  description = "ACM certificate ARN for HTTPS"
+  type        = string
+}
