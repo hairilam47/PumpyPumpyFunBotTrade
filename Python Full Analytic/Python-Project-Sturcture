@@ -1,0 +1,42 @@
+strategy-engine/
+├── requirements.txt
+├── setup.py
+├── main.py
+├── config/
+│   ├── __init__.py
+│   ├── dev.yaml
+│   ├── staging.yaml
+│   └── prod.yaml
+├── strategies/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── sniper.py
+│   ├── momentum.py
+│   ├── arbitrage.py
+│   └── mean_reversion.py
+├── analytics/
+│   ├── __init__.py
+│   ├── data_collector.py
+│   ├── indicators.py
+│   ├── ml_signals.py
+│   ├── backtester.py
+│   ├── risk_manager.py
+│   └── feature_engineering.py
+├── grpc_client/
+│   ├── __init__.py
+│   ├── client.py
+│   └── async_client.py
+├── models/
+│   ├── __init__.py
+│   ├── price_predictor.py
+│   ├── rugpull_detector.py
+│   └── sentiment_analyzer.py
+├── utils/
+│   ├── __init__.py
+│   ├── logger.py
+│   ├── metrics.py
+│   └── database.py
+└── tests/
+    ├── test_strategies.py
+    ├── test_analytics.py
+    └── test_integration.py
